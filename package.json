@@ -1,0 +1,22 @@
+{
+  "name": "pi-mermaid-render",
+  "version": "0.1.0",
+  "description": "Render Mermaid (```mermaid```) blocks from Pi assistant messages into PNGs in the transcript",
+  "license": "MIT",
+  "author": "Rafael Caricio <rafael@caricio.com>",
+  "keywords": ["pi-package", "pi-extension", "mermaid"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/canadoce/pi-mermaid-render"
+  },
+  "dependencies": {
+    "@mermaid-js/mermaid-cli": "^11.12.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
