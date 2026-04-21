@@ -1,3 +1,4 @@
 node_modules/
+.references/*
 .DS_Store
 npm-debug.log*
