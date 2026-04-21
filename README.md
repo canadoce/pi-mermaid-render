@@ -1,12 +1,15 @@
 # pi-mermaid-render
 
-Pi agent extension that automatically detects fenced Mermaid diagrams in assistant messages (```mermaid blocks), renders them to PNG via `@mermaid-js/mermaid-cli` (`mmdc`), and shows them in Pi’s transcript.
+Pi agent extension that automatically detects fenced Mermaid diagrams in assistant messages (```mermaid``` blocks), renders them as ASCII/Unicode diagrams with [`beautiful-mermaid`](https://www.npmjs.com/package/beautiful-mermaid), and shows them directly in Pi’s transcript.
 
-- Renders to: `/tmp/pi-mermaid-renders/*.png` (files are kept; no auto-cleanup)
+- Renders with `beautiful-mermaid` in isolated worker threads — no `mmdc`, Chromium, or Puppeteer
 - Transcript UX:
-  - Collapsed: preview image + clickable link
-  - Expanded: file URI, original Mermaid source, and full error output (if render failed)
-- If rendering fails, it also inserts a troubleshooting prompt into Pi’s editor so you can quickly ask the agent to fix the diagram.
+  - Collapsed: summary + compact preview of the first successfully rendered diagram
+  - Expanded: all diagrams from that assistant message stacked in a single grouped transcript entry
+  - Failed diagrams show diagnostics and original Mermaid source in expanded view
+- Mermaid rendering is queued in the background so Pi stays responsive even if a diagram is slow or broken
+- Mermaid transcript entries are kept visible in the session transcript/history, but filtered out of normal LLM context so future turns do not see the rendered ASCII output
+- If rendering fails, it also inserts a troubleshooting prompt into Pi’s editor so you can quickly ask the agent to fix the diagram yourself
 
 ## Install
 
@@ -37,26 +40,28 @@ Just ask the model to output a Mermaid diagram:
 ```mermaid
 graph TD
   A[User] --> B[Pi]
-  B --> C[Rendered PNG]
+  B --> C[ASCII Diagram]
 ```
 
 The extension will:
 1. extract all ` ```mermaid ... ``` ` blocks from the assistant message
-2. render each to a PNG via `mmdc`
-3. emit a custom transcript message with the rendered image and a `file://…` link
+2. render each to ASCII/Unicode with `beautiful-mermaid`
+3. emit a single grouped custom transcript message for that assistant message
+4. keep that transcript entry visible in session history, while excluding it from future LLM context
 
-Multiple diagrams in one assistant message are supported and labeled like `(1/3)`, `(2/3)`, …
-
-## Terminal image support
-
-Pi’s `Image` component will render inline images in supported terminals (Kitty, Ghostty, iTerm2, WezTerm, …). If your terminal can’t display images inline, you can still open the saved PNG using the emitted `file://…` link.
+If one assistant message contains multiple Mermaid blocks, they stay grouped together:
+- collapsed: summary + first preview
+- expanded: all diagrams stacked in order
 
 ## Notes / Troubleshooting
 
-- `@mermaid-js/mermaid-cli` uses Puppeteer/Chromium. The first install can take a bit (Chromium download).
-- This extension writes a Puppeteer config file to:
-  - `/tmp/pi-mermaid-renders/puppeteer-config.json`
-  - with `--no-sandbox` / `--disable-setuid-sandbox` to improve compatibility in restricted environments.
+- Rendering uses `beautiful-mermaid`’s synchronous `renderMermaidASCII()` API inside worker threads.
+- ASCII output is tuned for Pi transcript density with compact spacing (`paddingX: 1`, `paddingY: 1`, `boxBorderPadding: 0`).
+- Output is rendered as plain text in the transcript, so it works in any terminal supported by Pi.
+- Each diagram render runs with a timeout in the worker. If a render hangs or crashes, it is marked as failed and Pi remains usable.
+- On failure, the extension preserves the original Mermaid source and full diagnostics in the expanded transcript entry.
+- Mermaid render transcript entries are filtered out in Pi’s `context` hook, so they stay visible in transcript/session history without being forwarded to future model calls.
+- Rendering failures are **not** sent automatically to the LLM. Instead, the extension appends a troubleshooting prompt to Pi’s editor so you can decide whether to ask the model to fix the diagram.
 
 ## Development
 

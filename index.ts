@@ -2,56 +2,70 @@
  * Mermaid Render Extension
  *
  * Automatically detects ```mermaid``` code blocks in assistant messages,
- * renders them to PNG with mermaid-cli, and displays them in Pi's transcript
- * via a custom message renderer.
+ * renders them to ASCII/Unicode art with beautiful-mermaid, and displays
+ * them in Pi's transcript via a custom message renderer.
  *
- * The renderer uses Pi's native Image component and leans on Pi's built-in
- * collapsed/expanded transcript behavior:
- * - collapsed: rendered image + clickable file:// link
- * - expanded: additional details such as file path, original diagram source,
- *   and full error output for failures
+ * The renderer leans on Pi's built-in collapsed/expanded transcript behavior:
+ * - collapsed: summary + compact preview of the first successfully rendered diagram
+ * - expanded: all diagrams stacked, plus diagnostics/source for failures
  *
- * Generated files are stored in /tmp/pi-mermaid-renders/ and are not cleaned
- * up automatically.
+ * Rendering happens in worker threads via a background queue so Mermaid
+ * rendering never blocks Pi's main event loop or normal interaction.
  */
 
-import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 
-import { getMarkdownTheme, type ExtensionAPI, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
-import { Box, Image, Markdown, Spacer, Text, hyperlink } from "@mariozechner/pi-tui";
+import { getMarkdownTheme, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 
-const RENDER_DIR = "/tmp/pi-mermaid-renders";
-const PUPPETEER_CONFIG_PATH = join(RENDER_DIR, "puppeteer-config.json");
-const MMDC_TIMEOUT_MS = 30_000;
 const CUSTOM_TYPE = "mermaid-render";
+const COLLAPSED_MAX_LINES = 18;
+const COLLAPSED_MAX_COLUMNS = 96;
+const SECTION_SEPARATOR = "─".repeat(32);
+const RENDER_TIMEOUT_MS = 8_000;
+const RENDER_WORKER_URL = new URL("./render-worker.mjs", import.meta.url);
+const ASCII_RENDER_OPTIONS = {
+  colorMode: "none" as const,
+  paddingX: 1,
+  paddingY: 1,
+  boxBorderPadding: 0,
+};
 
-const PUPPETEER_CONFIG = JSON.stringify({
-  args: ["--no-sandbox", "--disable-setuid-sandbox"],
-});
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const MMDC_BIN = join(__dirname, "node_modules", ".bin", "mmdc");
-
-interface MermaidRenderDetails {
+interface MermaidDiagramRender {
+  index: number;
   label: string;
   source: string;
-  pngPath?: string;
+  ascii?: string;
   error?: string;
   fullError?: string;
 }
 
-interface MermaidImageContent {
-  type: "image";
-  data: string;
-  mimeType: string;
+interface MermaidRenderDetails {
+  count: number;
+  renderedCount: number;
+  failedCount: number;
+  diagrams: MermaidDiagramRender[];
 }
 
 interface MermaidTextContent {
   type: "text";
   text: string;
+}
+
+interface MermaidRenderWorkerRequest {
+  source: string;
+  options: typeof ASCII_RENDER_OPTIONS;
+}
+
+interface MermaidRenderWorkerResult {
+  ascii?: string;
+  error?: string;
+  fullError?: string;
+}
+
+interface MermaidRenderJob {
+  blocks: string[];
+  appendTroubleshootingPrompt: (prompt: string) => void;
 }
 
 function extractMermaidBlocks(text: string): string[] {
@@ -67,57 +81,203 @@ function extractMermaidBlocks(text: string): string[] {
   return blocks;
 }
 
-function getTextBlocks(content: string | (MermaidTextContent | MermaidImageContent)[]): MermaidTextContent[] {
+function getTextBlocks(content: string | MermaidTextContent[]): MermaidTextContent[] {
   if (typeof content === "string") return [{ type: "text", text: content }];
   return content.filter((block): block is MermaidTextContent => block.type === "text");
 }
 
-function getImageBlock(content: string | (MermaidTextContent | MermaidImageContent)[]): MermaidImageContent | undefined {
-  if (typeof content === "string") return undefined;
-  return content.find((block): block is MermaidImageContent => block.type === "image");
+function truncateAscii(ascii: string, maxLines: number, maxColumns: number): { text: string; truncated: boolean } {
+  const lines = ascii.split("\n");
+  let truncated = false;
+
+  const clippedLines = lines.slice(0, maxLines).map((line) => {
+    if (line.length <= maxColumns) return line;
+    truncated = true;
+    return `${line.slice(0, Math.max(0, maxColumns - 1))}…`;
+  });
+
+  if (lines.length > maxLines) truncated = true;
+
+  return {
+    text: clippedLines.join("\n"),
+    truncated,
+  };
 }
 
-async function ensureRenderDir(): Promise<void> {
-  await mkdir(RENDER_DIR, { recursive: true });
+function formatSummary(details: MermaidRenderDetails): string {
+  if (details.failedCount === 0) {
+    return details.count === 1
+      ? "✓ Mermaid diagram rendered as ASCII"
+      : `✓ Mermaid diagrams rendered as ASCII — ${details.count} diagrams`;
+  }
 
-  await withFileMutationQueue(PUPPETEER_CONFIG_PATH, async () => {
-    try {
-      await access(PUPPETEER_CONFIG_PATH);
-    } catch {
-      await writeFile(PUPPETEER_CONFIG_PATH, PUPPETEER_CONFIG, "utf8");
-    }
+  if (details.renderedCount === 0) {
+    return details.count === 1
+      ? "✗ Mermaid diagram failed to render"
+      : `✗ Mermaid diagrams failed to render — ${details.failedCount}/${details.count} failed`;
+  }
+
+  return `⚠ Mermaid diagrams rendered with errors — ${details.renderedCount} rendered, ${details.failedCount} failed`;
+}
+
+function getPreviewDiagram(details: MermaidRenderDetails): MermaidDiagramRender | undefined {
+  return details.diagrams.find((diagram) => diagram.ascii) ?? details.diagrams[0];
+}
+
+function buildFailureMarkdown(diagram: MermaidDiagramRender): string {
+  return [
+    "**Error output**",
+    "```text",
+    diagram.fullError ?? diagram.error ?? "Unknown Mermaid render error",
+    "```",
+    "",
+    "**Original diagram**",
+    "```mermaid",
+    diagram.source,
+    "```",
+  ].join("\n");
+}
+
+function buildTroubleshootingPrompt(diagram: MermaidDiagramRender): string {
+  return [
+    `Mermaid rendering failed${diagram.label}. Help me diagnose and fix this diagram for beautiful-mermaid ASCII rendering.`,
+    "",
+    "Error output:",
+    diagram.fullError ?? diagram.error ?? "Unknown Mermaid render error",
+    "",
+    "Original diagram:",
+    "```mermaid",
+    diagram.source,
+    "```",
+  ].join("\n");
+}
+
+function renderDiagramInWorker(source: string): Promise<MermaidRenderWorkerResult> {
+  return new Promise((resolve) => {
+    const worker = new Worker(RENDER_WORKER_URL, { type: "module", execArgv: [] });
+    let settled = false;
+
+    const finish = (result: MermaidRenderWorkerResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      worker.removeAllListeners();
+      void worker.terminate().catch(() => {});
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      finish({
+        error: `Mermaid render timed out after ${Math.floor(RENDER_TIMEOUT_MS / 1000)}s`,
+        fullError: `Rendering exceeded the timeout of ${RENDER_TIMEOUT_MS}ms and the worker was terminated.`,
+      });
+    }, RENDER_TIMEOUT_MS);
+
+    worker.once("message", (result: MermaidRenderWorkerResult) => finish(result));
+    worker.once("error", (err: Error) => {
+      finish({
+        error: err.message,
+        fullError: err.stack ?? err.message,
+      });
+    });
+    worker.once("exit", (code) => {
+      if (!settled && code !== 0) {
+        finish({
+          error: `Mermaid render worker exited with code ${code}`,
+          fullError: `Mermaid render worker exited unexpectedly with code ${code}.`,
+        });
+      }
+    });
+
+    const request: MermaidRenderWorkerRequest = { source, options: ASCII_RENDER_OPTIONS };
+    worker.postMessage(request);
   });
 }
 
-async function renderToPng(pi: ExtensionAPI, source: string): Promise<string> {
-  await ensureRenderDir();
+export default function mermaidRender(pi: ExtensionAPI) {
+  const renderQueue: MermaidRenderJob[] = [];
+  let isProcessingQueue = false;
 
-  const id = randomUUID();
-  const inputFile = join(RENDER_DIR, `${id}.mmd`);
-  const outputFile = join(RENDER_DIR, `${id}.png`);
+  async function processRenderJob(job: MermaidRenderJob): Promise<void> {
+    const diagrams: MermaidDiagramRender[] = [];
 
-  await writeFile(inputFile, source, "utf8");
+    for (let i = 0; i < job.blocks.length; i++) {
+      const source = job.blocks[i]!;
+      const label = job.blocks.length > 1 ? ` (${i + 1}/${job.blocks.length})` : "";
 
-  const result = await pi.exec(
-    MMDC_BIN,
-    [
-      "--input", inputFile,
-      "--output", outputFile,
-      "--backgroundColor", "transparent",
-      "--puppeteerConfigFile", PUPPETEER_CONFIG_PATH,
-      "--quiet",
-    ],
-    { timeout: MMDC_TIMEOUT_MS },
-  );
+      try {
+        const result = await renderDiagramInWorker(source);
+        if (result.ascii) {
+          diagrams.push({ index: i, label, source, ascii: result.ascii });
+        } else {
+          diagrams.push({
+            index: i,
+            label,
+            source,
+            error: result.error ?? "Mermaid render failed",
+            fullError: result.fullError ?? result.error ?? "Mermaid render failed",
+          });
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        diagrams.push({
+          index: i,
+          label,
+          source,
+          error: msg,
+          fullError: err instanceof Error ? (err.stack ?? msg) : msg,
+        });
+      }
+    }
 
-  if (result.code !== 0) {
-    throw new Error(result.stderr || result.stdout || `mmdc exited with code ${result.code}`);
+    for (const diagram of diagrams) {
+      if (!diagram.error) continue;
+      job.appendTroubleshootingPrompt(buildTroubleshootingPrompt(diagram));
+    }
+
+    const details = {
+      count: diagrams.length,
+      renderedCount: diagrams.filter((diagram) => Boolean(diagram.ascii)).length,
+      failedCount: diagrams.filter((diagram) => Boolean(diagram.error)).length,
+      diagrams,
+    } satisfies MermaidRenderDetails;
+
+    pi.sendMessage({
+      customType: CUSTOM_TYPE,
+      content: [{ type: "text", text: formatSummary(details) }],
+      display: true,
+      details,
+    });
   }
 
-  return outputFile;
-}
+  async function processRenderQueue(): Promise<void> {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
 
-export default function mermaidRender(pi: ExtensionAPI) {
+    try {
+      while (renderQueue.length > 0) {
+        const job = renderQueue.shift();
+        if (!job) continue;
+
+        try {
+          await processRenderJob(job);
+        } catch (err) {
+          console.error("[pi-mermaid-render] Failed to process render job:", err);
+        }
+      }
+    } finally {
+      isProcessingQueue = false;
+      if (renderQueue.length > 0) {
+        void processRenderQueue();
+      }
+    }
+  }
+
+  function enqueueRenderJob(job: MermaidRenderJob): void {
+    renderQueue.push(job);
+    void processRenderQueue();
+  }
+
   pi.registerMessageRenderer(CUSTOM_TYPE, (message, { expanded }, theme) => {
     const details = message.details as MermaidRenderDetails | undefined;
     const markdownTheme = getMarkdownTheme();
@@ -129,102 +289,98 @@ export default function mermaidRender(pi: ExtensionAPI) {
     }
 
     const textBlocks = getTextBlocks(message.content);
-    const summary = textBlocks[0]?.text ?? "Mermaid render";
-    const imageBlock = getImageBlock(message.content);
-
-    if (details.error) {
-      box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[mermaid]\x1b[22m"), 0, 0));
-      box.addChild(new Spacer(1));
-      box.addChild(
-        new Text(
-          `${theme.fg("error", "✗ Mermaid render failed")}${details.label}${theme.fg("dim", " — expand for full diagnostics")}`,
-          0,
-          0,
-        ),
-      );
-      box.addChild(new Spacer(1));
-      box.addChild(new Text(theme.fg("dim", summary), 0, 0));
-
-      if (expanded) {
-        const expandedMarkdown = [
-          "**Error output**",
-          "```text",
-          details.fullError ?? details.error,
-          "```",
-          "",
-          "**Original diagram**",
-          "```mermaid",
-          details.source,
-          "```",
-        ].join("\n");
-
-        box.addChild(new Spacer(1));
-        box.addChild(
-          new Markdown(expandedMarkdown, 0, 0, markdownTheme, {
-            color: (text: string) => theme.fg("customMessageText", text),
-          }),
-        );
-      }
-
-      return box;
-    }
-
-    const fileUri = details.pngPath ? `file://${details.pngPath}` : undefined;
-    const openLink = fileUri ? hyperlink("Open rendered PNG", fileUri) : "Open rendered PNG";
+    const summary = textBlocks[0]?.text ?? formatSummary(details);
+    const previewDiagram = getPreviewDiagram(details);
 
     box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[mermaid]\x1b[22m"), 0, 0));
     box.addChild(new Spacer(1));
     box.addChild(
       new Text(
-        `${theme.fg("success", "✓ Mermaid diagram rendered")}${details.label}${theme.fg("dim", " — expand for source/details")}`,
+        details.failedCount > 0 && details.renderedCount === 0
+          ? theme.fg("error", summary)
+          : details.failedCount > 0
+            ? `${theme.fg("warning", summary)}${theme.fg("dim", expanded ? "" : " — expand for details")}`
+            : `${theme.fg("success", summary)}${theme.fg("dim", expanded ? "" : " — expand to see all diagrams")}`,
         0,
         0,
       ),
     );
 
-    if (imageBlock) {
-      const imageOptions = expanded
-        ? { maxWidthCells: 80, maxHeightCells: 40, filename: `mermaid${details.label}.png` }
-        : { maxWidthCells: 40, maxHeightCells: 16, filename: `mermaid${details.label}.png` };
+    if (!expanded) {
+      if (previewDiagram?.ascii) {
+        const preview = truncateAscii(previewDiagram.ascii, COLLAPSED_MAX_LINES, COLLAPSED_MAX_COLUMNS);
 
-      box.addChild(new Spacer(1));
-      box.addChild(
-        new Image(
-          imageBlock.data,
-          imageBlock.mimeType,
-          { fallbackColor: (s) => theme.fg("dim", s) },
-          imageOptions,
-        ),
-      );
+        box.addChild(new Spacer(1));
+        box.addChild(
+          new Text(
+            theme.fg("dim", `Previewing diagram ${previewDiagram.index + 1}/${details.count}`),
+            0,
+            0,
+          ),
+        );
+        box.addChild(new Spacer(1));
+        box.addChild(new Text(theme.fg("customMessageText", preview.text), 0, 0));
+
+        if (preview.truncated) {
+          box.addChild(new Spacer(1));
+          box.addChild(new Text(theme.fg("dim", "Preview truncated — expand to see all diagrams"), 0, 0));
+        }
+      } else if (previewDiagram?.error) {
+        box.addChild(new Spacer(1));
+        box.addChild(new Text(theme.fg("dim", `Diagram ${previewDiagram.index + 1}/${details.count} failed`), 0, 0));
+        box.addChild(new Spacer(1));
+        box.addChild(new Text(theme.fg("error", previewDiagram.error), 0, 0));
+      }
+
+      return box;
     }
 
-    box.addChild(new Spacer(1));
-    box.addChild(new Text(`${theme.fg("dim", "File:")} ${openLink}`, 0, 0));
-
-    if (expanded) {
-      const expandedMarkdown = [
-        fileUri ? `**Rendered file:** [${fileUri}](${fileUri})` : undefined,
-        "",
-        "**Original diagram**",
-        "```mermaid",
-        details.source,
-        "```",
-      ]
-        .filter((line): line is string => line !== undefined)
-        .join("\n");
+    for (let i = 0; i < details.diagrams.length; i++) {
+      const diagram = details.diagrams[i]!;
 
       box.addChild(new Spacer(1));
       box.addChild(
-        new Markdown(expandedMarkdown, 0, 0, markdownTheme, {
-          color: (text: string) => theme.fg("customMessageText", text),
-        }),
+        new Text(
+          theme.fg(
+            diagram.ascii ? "customMessageText" : "error",
+            `Diagram ${diagram.index + 1} of ${details.count}${diagram.ascii ? "" : " — failed"}`,
+          ),
+          0,
+          0,
+        ),
       );
+      box.addChild(new Spacer(1));
+
+      if (diagram.ascii) {
+        box.addChild(new Text(theme.fg("customMessageText", diagram.ascii), 0, 0));
+      } else {
+        box.addChild(new Text(theme.fg("error", diagram.error ?? "Mermaid render failed"), 0, 0));
+        box.addChild(new Spacer(1));
+        box.addChild(
+          new Markdown(buildFailureMarkdown(diagram), 0, 0, markdownTheme, {
+            color: (text: string) => theme.fg("customMessageText", text),
+          }),
+        );
+      }
+
+      if (i < details.diagrams.length - 1) {
+        box.addChild(new Spacer(1));
+        box.addChild(new Text(theme.fg("dim", SECTION_SEPARATOR), 0, 0));
+      }
     }
 
     return box;
   });
 
-  pi.on("message_end", async (event, ctx) => {
+  pi.on("context", (event, _ctx) => {
+    return {
+      messages: event.messages.filter((message) => {
+        return !(message.role === "custom" && message.customType === CUSTOM_TYPE);
+      }),
+    };
+  });
+
+  pi.on("message_end", (event, ctx) => {
     if (!ctx.hasUI) return;
     if (event.message.role !== "assistant") return;
 
@@ -238,61 +394,16 @@ export default function mermaidRender(pi: ExtensionAPI) {
     const blocks = extractMermaidBlocks(fullText);
     if (blocks.length === 0) return;
 
-    for (let i = 0; i < blocks.length; i++) {
-      const source = blocks[i];
-      const label = blocks.length > 1 ? ` (${i + 1}/${blocks.length})` : "";
-
-      try {
-        const pngPath = await renderToPng(pi, source);
-        const base64 = (await readFile(pngPath)).toString("base64");
-        const fileUri = `file://${pngPath}`;
-
-        pi.sendMessage({
-          customType: CUSTOM_TYPE,
-          content: [
-            { type: "text", text: `Rendered Mermaid diagram${label}` },
-            { type: "image", data: base64, mimeType: "image/png" },
-            { type: "text", text: `Open rendered PNG: ${fileUri}` },
-          ],
-          display: true,
-          details: { label, pngPath, source } satisfies MermaidRenderDetails,
-        });
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        const fullError = (err as { stderr?: string }).stderr ?? msg;
-        const summary = fullError.slice(0, 300);
-
-        pi.sendMessage({
-          customType: CUSTOM_TYPE,
-          content: [{ type: "text", text: summary }],
-          display: true,
-          details: {
-            label,
-            source,
-            error: summary,
-            fullError,
-          } satisfies MermaidRenderDetails,
-        });
-
-        const troubleshootingPrompt = [
-          `Mermaid rendering failed${label}. Help me diagnose and fix this diagram for mermaid-cli.`,
-          "",
-          "Error output:",
-          fullError,
-          "",
-          "Original diagram:",
-          "```mermaid",
-          source,
-          "```",
-        ].join("\n");
-
+    enqueueRenderJob({
+      blocks,
+      appendTroubleshootingPrompt: (prompt: string) => {
         const currentEditorText = ctx.ui.getEditorText();
         if (currentEditorText.trim().length === 0) {
-          ctx.ui.setEditorText(troubleshootingPrompt);
+          ctx.ui.setEditorText(prompt);
         } else {
-          ctx.ui.pasteToEditor(`\n\n${troubleshootingPrompt}`);
+          ctx.ui.pasteToEditor(`\n\n${prompt}`);
         }
-      }
-    }
+      },
+    });
   });
 }
